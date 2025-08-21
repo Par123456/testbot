@@ -489,7 +489,8 @@ def text_handler(message):
 
     elif text == 'برگشت':
         if is_admin(user_id):
-            del user_states[user_id] if user_id in user_states else None
+            if user_id in user_states:
+                del user_states[user_id]
             bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
         else:
             bot.send_message(user_id, "بازگشت.", reply_markup=ReplyKeyboardRemove())
