@@ -201,11 +201,18 @@ def start_handler(message):
 def contact_handler(message):
     user_id = message.from_user.id
     phone = message.contact.phone_number
-    if not phone.startswith('+98') or len(phone) != 13 or not phone[3:].isdigit():
-        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx). لطفا دوباره امتحان کنید.")
+    normalized_phone = None
+    if phone.startswith('+98'):
+        if len(phone) == 13 and phone[3:].isdigit() and phone[3] == '9':
+            normalized_phone = phone
+    elif phone.startswith('09'):
+        if len(phone) == 11 and phone[2:].isdigit():
+            normalized_phone = '+98' + phone[1:]
+    if normalized_phone is None:
+        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx یا 09xxxxxxxxxx). لطفا دوباره امتحان کنید.")
         return
 
-    cur.execute("UPDATE users SET phone=?, verified=1 WHERE user_id=?", (phone, user_id))
+    cur.execute("UPDATE users SET phone=?, verified=1 WHERE user_id=?", (normalized_phone, user_id))
     conn.commit()
     bot.send_message(user_id, "احراز هویت موفق! حالا می‌توانید از ربات استفاده کنید.", reply_markup=ReplyKeyboardRemove())
 
