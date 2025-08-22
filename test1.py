@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 TOKEN = '8358000057:AAHRxNRay0kS4T2k10EKB13f_i0rut8E4JQ'
-OWNER_ID = 7391705411
+OWNER_ID = 6508600903
 
 bot = telebot.TeleBot(TOKEN)
 bot_username = bot.get_me().username
