@@ -201,8 +201,8 @@ def start_handler(message):
 def contact_handler(message):
     user_id = message.from_user.id
     phone = message.contact.phone_number
-    if not phone.startswith('+98'):
-        bot.send_message(user_id, "شماره باید ایرانی باشد (+98). لطفا دوباره امتحان کنید.")
+    if not phone.startswith('+98') or len(phone) != 13 or not phone[3:].isdigit():
+        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx). لطفا دوباره امتحان کنید.")
         return
 
     cur.execute("UPDATE users SET phone=?, verified=1 WHERE user_id=?", (phone, user_id))
