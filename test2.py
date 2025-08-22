@@ -1,0 +1,670 @@
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+import sqlite3
+import time
+import threading
+from datetime import datetime
+import re
+import logging
+
+# Setup logging for better debugging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+TOKEN = '8358000057:AAHRxNRay0kS4T2k10EKB13f_i0rut8E4JQ'
+OWNER_ID = 6508600903
+
+bot = telebot.TeleBot(TOKEN)
+bot_username = bot.get_me().username
+
+# Use a lock for thread-safe database operations
+db_lock = threading.Lock()
+
+conn = sqlite3.connect('bot.db', check_same_thread=False)
+cur = conn.cursor()
+
+# Create tables if not exist
+with db_lock:
+    cur.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        name TEXT,
+        phone TEXT,
+        verified INTEGER DEFAULT 0,
+        inviter_id INTEGER,
+        score REAL DEFAULT 0.0,
+        credited INTEGER DEFAULT 0
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY,
+        is_owner INTEGER DEFAULT 0
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS required_chats (
+        chat_id INTEGER PRIMARY KEY,
+        username TEXT
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_score', '0.5')")
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_text', 'پشتیبانی: تماس با @admin')")
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('guide_text', 'راهنما: دعوت دوستان برای امتیاز')")
+    cur.execute("INSERT OR IGNORE INTO admins (user_id, is_owner) VALUES (?, 1)", (OWNER_ID,))
+    conn.commit()
+
+user_states = {}  # User states for multi-step interactions
+
+def get_referral_score():
+    with db_lock:
+        cur.execute("SELECT value FROM settings WHERE key='referral_score'")
+        return float(cur.fetchone()[0])
+
+def set_referral_score(new_score):
+    with db_lock:
+        cur.execute("UPDATE settings SET value=? WHERE key='referral_score'", (str(new_score),))
+        conn.commit()
+
+def get_support_text():
+    with db_lock:
+        cur.execute("SELECT value FROM settings WHERE key='support_text'")
+        return cur.fetchone()[0]
+
+def set_support_text(text):
+    with db_lock:
+        cur.execute("UPDATE settings SET value=? WHERE key='support_text'", (text,))
+        conn.commit()
+
+def get_guide_text():
+    with db_lock:
+        cur.execute("SELECT value FROM settings WHERE key='guide_text'")
+        return cur.fetchone()[0]
+
+def set_guide_text(text):
+    with db_lock:
+        cur.execute("UPDATE settings SET value=? WHERE key='guide_text'", (text,))
+        conn.commit()
+
+def is_admin(user_id):
+    with db_lock:
+        cur.execute("SELECT * FROM admins WHERE user_id=?", (user_id,))
+        return cur.fetchone() is not None
+
+def is_owner(user_id):
+    with db_lock:
+        cur.execute("SELECT is_owner FROM admins WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return row and row[0] == 1
+
+def get_required_chats():
+    with db_lock:
+        cur.execute("SELECT chat_id, username FROM required_chats")
+        return cur.fetchall()
+
+def is_member_in_all(user_id):
+    required = get_required_chats()
+    if not required:
+        return True
+    for chat_id, _ in required:
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                return False
+        except Exception as e:
+            logging.error(f"Error checking membership for user {user_id} in chat {chat_id}: {e}")
+            return False
+    return True
+
+def get_user_referrals(user_id):
+    with db_lock:
+        cur.execute("SELECT user_id FROM users WHERE inviter_id=?", (user_id,))
+        return [row[0] for row in cur.fetchall()]
+
+def all_referrals_member(user_id):
+    refs = get_user_referrals(user_id)
+    for ref in refs:
+        if not is_member_in_all(ref):
+            return False
+    return True
+
+def save_user(user_id, username, name):
+    with db_lock:
+        cur.execute("INSERT OR REPLACE INTO users (user_id, username, name) VALUES (?, ?, ?)", (user_id, username, name))
+        conn.commit()
+
+def has_pending_withdraw(user_id):
+    with db_lock:
+        cur.execute("SELECT id FROM withdraw_requests WHERE user_id=? AND status='pending'", (user_id,))
+        return cur.fetchone() is not None
+
+def get_pending_requests():
+    with db_lock:
+        cur.execute("SELECT id, user_id, amount, created_at FROM withdraw_requests WHERE status='pending' ORDER BY created_at")
+        return cur.fetchall()
+
+def main_menu():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("📩 دعوت دوستان", callback_data='invite'))
+    markup.add(InlineKeyboardButton("⭐ امتیازات من", callback_data='scores'), InlineKeyboardButton("ℹ️ راهنما", callback_data='guide'))
+    markup.add(InlineKeyboardButton("💰 برداشت", callback_data='withdraw'), InlineKeyboardButton("👤 پشتیبانی", callback_data='support'))
+    markup.add(InlineKeyboardButton("🔄 بررسی عضویت", callback_data='check_join'))
+    return markup
+
+def withdraw_menu():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("15 استارز", callback_data='wd_15'))
+    markup.add(InlineKeyboardButton("30 استارز", callback_data='wd_30'))
+    markup.add(InlineKeyboardButton("100 استارز", callback_data='wd_100'))
+    markup.add(InlineKeyboardButton("500 استارز", callback_data='wd_500'))
+    markup.add(InlineKeyboardButton("برگشت", callback_data='back_main'))
+    return markup
+
+def admin_menu(user_id):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if is_owner(user_id):
+        markup.add("افزودن ادمین", "حذف ادمین")
+    markup.add("پیام همگانی", "افزودن کانال/گروه", "حذف کانال/گروه")
+    if is_owner(user_id):
+        markup.add("تغییر مقدار زیرمجموعه")
+    markup.add("تنظیم متن پشتیبانی", "تنظیم متن راهنما")
+    markup.add("لیست درخواست‌های برداشت", "آمار کلی")
+    markup.add("برگشت")
+    return markup
+
+def join_menu():
+    required = get_required_chats()
+    if not required:
+        return None
+    markup = InlineKeyboardMarkup(row_width=1)
+    for _, username in required:
+        url = f"https://t.me/{username.lstrip('@')}"
+        markup.add(InlineKeyboardButton(f"عضویت در {username}", url=url))
+    markup.add(InlineKeyboardButton("✅ بررسی عضویت", callback_data='check_join'))
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    name = message.from_user.first_name
+    save_user(user_id, username, name)
+
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith('ref_'):
+        try:
+            inviter_id = int(args[1].split('_')[1])
+            with db_lock:
+                cur.execute("UPDATE users SET inviter_id=? WHERE user_id=? AND inviter_id IS NULL", (inviter_id, user_id))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error setting inviter for user {user_id}: {e}")
+
+    with db_lock:
+        cur.execute("SELECT verified FROM users WHERE user_id=?", (user_id,))
+        verified = cur.fetchone()[0]
+
+    if verified:
+        join_markup = join_menu()
+        if join_markup:
+            bot.send_message(user_id, "برای استفاده از ربات، ابتدا در کانال‌ها و گروه‌های زیر عضو شوید:", reply_markup=join_markup)
+        else:
+            bot.send_message(user_id, "خوش آمدید!", reply_markup=main_menu())
+    else:
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        btn = KeyboardButton("احراز هویت با شماره ایران", request_contact=True)
+        markup.add(btn)
+        welcome_text = """━━━━━━━━━━━━━━━━━━━━━━
+🌟 *𝑾𝒆𝒍𝒄𝒐𝒎𝒆 𝒕𝒐  𝐆𝐨𝐥𝐝𝐞𝐧𝐒𝐭𝐚𝐫𝐬* 🌟
+━━━━━━━━━━━━━━━━━━━━━━
+
+
+💎 به دنیای GoldenStars خوش آمدید!  
+🔐 برای فعال‌ سازی حساب و استفاده از امکانات ویژه :  
+  📲 لطفاً روی دکمه زیر بزنید و شماره خود را ارسال کنید.
+
+📌 ارسال شماره از طریق تلگرام امن و رمزگذاری‌ شده است."""
+        bot.send_message(user_id, welcome_text, reply_markup=markup, parse_mode='Markdown')
+
+@bot.message_handler(content_types=['contact'])
+def contact_handler(message):
+    user_id = message.from_user.id
+    phone_raw = message.contact.phone_number
+    digits = re.sub(r'\D', '', phone_raw)
+    normalized_phone = None
+    if len(digits) == 12 and digits.startswith('989'):
+        normalized_phone = '+' + digits
+    elif len(digits) == 11 and digits.startswith('09'):
+        normalized_phone = '+98' + digits[1:]
+    elif len(digits) == 10 and digits.startswith('9'):
+        normalized_phone = '+98' + digits
+    if normalized_phone is None or not (normalized_phone.startswith('+98') and len(normalized_phone) == 13 and normalized_phone[3:].isdigit() and normalized_phone[3] == '9'):
+        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx یا 09xxxxxxxxxx یا 9xxxxxxxxxx). لطفا دوباره امتحان کنید.")
+        return
+
+    with db_lock:
+        cur.execute("UPDATE users SET phone=?, verified=1 WHERE user_id=?", (normalized_phone, user_id))
+        conn.commit()
+    success_text = """✅ احراز هویت شما با موفقیت انجام شد!  
+🎯 از حالا می‌توانید از تمام امکانات VIP ربات استفاده کنید.  
+💎 به جمع کاربران طلایی خوش آمدید!"""
+    bot.send_message(user_id, success_text, reply_markup=ReplyKeyboardRemove(), parse_mode='Markdown')
+
+    join_markup = join_menu()
+    if join_markup:
+        bot.send_message(user_id, "برای استفاده کامل، در کانال‌ها و گروه‌های زیر عضو شوید:", reply_markup=join_markup)
+    else:
+        bot.send_message(user_id, "منوی اصلی:", reply_markup=main_menu())
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+
+    if data == 'invite':
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        bot.answer_callback_query(call.id, "لینک دعوت شما آماده است.")
+        bot.send_message(user_id, f"لینک دعوت: {ref_link}\nهر زیرمجموعه موفق: {get_referral_score()} استارز\nزیرمجموعه باید احراز هویت کند و در تمام کانال‌ها عضو بماند.")
+
+    elif data == 'scores':
+        with db_lock:
+            cur.execute("SELECT score FROM users WHERE user_id=?", (user_id,))
+            score = cur.fetchone()[0]
+        refs_count = len(get_user_referrals(user_id))
+        bot.answer_callback_query(call.id, f"امتیاز شما: {score} استارز\nتعداد زیرمجموعه: {refs_count}")
+
+    elif data == 'guide':
+        text = get_guide_text()
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, text)
+
+    elif data == 'support':
+        text = get_support_text()
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, text)
+
+    elif data == 'withdraw':
+        if has_pending_withdraw(user_id):
+            bot.answer_callback_query(call.id, "شما یک درخواست برداشت pending دارید. منتظر تایید باشید.")
+            return
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, "مقدار برداشت را انتخاب کنید:", reply_markup=withdraw_menu())
+
+    elif data.startswith('wd_'):
+        amount = float(data.split('_')[1])
+        with db_lock:
+            cur.execute("SELECT score FROM users WHERE user_id=?", (user_id,))
+            score = cur.fetchone()[0]
+        if score < amount:
+            bot.answer_callback_query(call.id, "امتیاز کافی ندارید.")
+            return
+        if not all_referrals_member(user_id):
+            bot.answer_callback_query(call.id, "برخی زیرمجموعه‌ها در تمام گروه‌ها عضو نیستند.")
+            return
+        with db_lock:
+            cur.execute("INSERT INTO withdraw_requests (user_id, amount) VALUES (?, ?)", (user_id, amount))
+            conn.commit()
+            request_id = cur.lastrowid
+
+        with db_lock:
+            cur.execute("SELECT username, name FROM users WHERE user_id=?", (user_id,))
+            username, name = cur.fetchone()
+
+        with db_lock:
+            cur.execute("SELECT user_id FROM admins")
+            admins_list = [row[0] for row in cur.fetchall()]
+        msg = f"کاربر @{username} ({user_id}) {name} درخواست برداشت {amount} استارز کرده.\nلطفا در اسرع وقت واریز کنید."
+        for adm in admins_list:
+            try:
+                bot.send_message(adm, msg)
+            except Exception as e:
+                logging.error(f"Error sending withdraw notification to admin {adm}: {e}")
+
+        bot.answer_callback_query(call.id, "درخواست ارسال شد.")
+        bot.send_message(user_id, "کاربر محترم، چند دقیقه یا چند ساعت منتظر بمانید. ادمین‌ها در حال پردازش هستند.")
+
+    elif data == 'back_main':
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, "منوی اصلی:", reply_markup=main_menu())
+
+    elif data == 'check_join':
+        if is_member_in_all(user_id):
+            with db_lock:
+                cur.execute("SELECT inviter_id, credited FROM users WHERE user_id=?", (user_id,))
+                row = cur.fetchone()
+                inviter_id, credited = row
+                if inviter_id and credited == 0:
+                    score_add = get_referral_score()
+                    cur.execute("UPDATE users SET score = score + ? WHERE user_id=?", (score_add, inviter_id))
+                    cur.execute("UPDATE users SET credited=1 WHERE user_id=?", (user_id,))
+                    conn.commit()
+                    try:
+                        bot.send_message(inviter_id, f"زیرمجموعه جدید شما تایید شد. +{score_add} استارز")
+                    except Exception as e:
+                        logging.error(f"Error notifying inviter {inviter_id}: {e}")
+            bot.answer_callback_query(call.id, "عضویت شما در تمام کانال‌ها تایید شد.")
+            bot.send_message(user_id, "منوی اصلی:", reply_markup=main_menu())
+        else:
+            bot.answer_callback_query(call.id, "شما هنوز در تمام کانال‌ها عضو نیستید.")
+
+@bot.chat_member_handler()
+def chat_member_update(update):
+    if update.new_chat_member.status == 'left':
+        user_id = update.new_chat_member.user.id
+        chat_id = update.chat.id
+        with db_lock:
+            cur.execute("SELECT * FROM required_chats WHERE chat_id=?", (chat_id,))
+            if cur.fetchone():
+                cur.execute("SELECT inviter_id, credited, username FROM users WHERE user_id=?", (user_id,))
+                row = cur.fetchone()
+                if row:
+                    inviter_id, credited, username = row
+                    if inviter_id and credited == 1:
+                        score_ded = get_referral_score()
+                        cur.execute("UPDATE users SET score = score - ? WHERE user_id=?", (score_ded, inviter_id))
+                        cur.execute("UPDATE users SET credited=0 WHERE user_id=?", (user_id,))
+                        conn.commit()
+                        try:
+                            bot.send_message(inviter_id, f"زیرمجموعه شما @{username} از کانال لف داد. امتیاز {score_ded} کسر شد.")
+                        except Exception as e:
+                            logging.error(f"Error notifying inviter {inviter_id} about leave: {e}")
+
+@bot.message_handler(commands=['admin'])
+def admin_handler(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        bot.send_message(user_id, "شما ادمین نیستید.")
+        return
+    bot.send_message(user_id, "پنل ادمینی:", reply_markup=admin_menu(user_id))
+
+@bot.message_handler(commands=['end'])
+def end_handler(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        bot.send_message(user_id, "فرمت: /end request_id رسید")
+        return
+    try:
+        req_id = int(args[1])
+        hash_tx = args[2]
+    except ValueError:
+        bot.send_message(user_id, "آیدی درخواست نامعتبر.")
+        return
+    with db_lock:
+        cur.execute("SELECT user_id, amount, status FROM withdraw_requests WHERE id=? AND status='pending'", (req_id,))
+        row = cur.fetchone()
+        if not row:
+            bot.send_message(user_id, "درخواست pending یافت نشد.")
+            return
+        target_id, amount, _ = row
+        cur.execute("UPDATE withdraw_requests SET status='done' WHERE id=?", (req_id,))
+        cur.execute("UPDATE users SET score = score - ? WHERE user_id=?", (amount, target_id))
+        conn.commit()
+    try:
+        bot.send_message(target_id, f"درخواست برداشت شما انجام شد. رسید تراکنش: {hash_tx}")
+    except Exception as e:
+        logging.error(f"Error notifying user {target_id} about withdrawal: {e}")
+    bot.send_message(user_id, "تایید شد.")
+
+@bot.message_handler(commands=['reject'])
+def reject_handler(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.send_message(user_id, "فرمت: /reject request_id")
+        return
+    try:
+        req_id = int(args[1])
+    except ValueError:
+        bot.send_message(user_id, "آیدی درخواست نامعتبر.")
+        return
+    with db_lock:
+        cur.execute("SELECT user_id, status FROM withdraw_requests WHERE id=? AND status='pending'", (req_id,))
+        row = cur.fetchone()
+        if not row:
+            bot.send_message(user_id, "درخواست pending یافت نشد.")
+            return
+        target_id, _ = row
+        cur.execute("UPDATE withdraw_requests SET status='rejected' WHERE id=?", (req_id,))
+        conn.commit()
+    try:
+        bot.send_message(target_id, "درخواست برداشت شما رد شد. لطفا با پشتیبانی تماس بگیرید.")
+    except Exception as e:
+        logging.error(f"Error notifying user {target_id} about rejection: {e}")
+    bot.send_message(user_id, "درخواست رد شد.")
+
+@bot.message_handler(func=lambda m: True)
+def text_handler(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    state = user_states.get(user_id)
+
+    if state == 'broadcast':
+        with db_lock:
+            cur.execute("SELECT user_id FROM users")
+            users = [row[0] for row in cur.fetchall()]
+        sent_count = 0
+        for uid in users:
+            try:
+                bot.send_message(uid, text)
+                sent_count += 1
+            except Exception as e:
+                logging.warning(f"Failed to send broadcast to {uid}: {e}")
+        bot.send_message(user_id, f"پیام همگانی به {sent_count} کاربر ارسال شد.")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'add_admin':
+        username = text.lstrip('@')
+        try:
+            if username.isdigit():
+                new_id = int(username)
+            else:
+                new_id = bot.get_chat(f'@{username}').id
+            with db_lock:
+                cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_id,))
+                conn.commit()
+            bot.send_message(user_id, "ادمین اضافه شد.")
+        except Exception as e:
+            bot.send_message(user_id, "یوزرنیم یا آیدی نامعتبر.")
+            logging.error(f"Error adding admin {username}: {e}")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'del_admin':
+        username = text.lstrip('@')
+        try:
+            if username.isdigit():
+                del_id = int(username)
+            else:
+                del_id = bot.get_chat(f'@{username}').id
+            with db_lock:
+                cur.execute("DELETE FROM admins WHERE user_id=? AND is_owner=0", (del_id,))
+                conn.commit()
+            bot.send_message(user_id, "ادمین حذف شد.")
+        except Exception as e:
+            bot.send_message(user_id, "یوزرنیم یا آیدی نامعتبر.")
+            logging.error(f"Error deleting admin {username}: {e}")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'add_channel':
+        if text.startswith('@'):
+            chat_username = text
+        elif 't.me/' in text:
+            chat_username = '@' + text.split('t.me/')[1].split('/')[0]
+        else:
+            bot.send_message(user_id, "لینک یا آیدی معتبر بفرستید.")
+            return
+        try:
+            chat = bot.get_chat(chat_username)
+            member = bot.get_chat_member(chat.id, bot.get_me().id)
+            if member.status != 'administrator':
+                bot.send_message(user_id, "ربات ادمین آنجا نیست.")
+                return
+            with db_lock:
+                cur.execute("INSERT OR IGNORE INTO required_chats (chat_id, username) VALUES (?, ?)", (chat.id, chat_username))
+                conn.commit()
+            bot.send_message(user_id, "کانال/گروه اضافه شد.")
+        except Exception as e:
+            bot.send_message(user_id, "خطا در افزودن.")
+            logging.error(f"Error adding channel {chat_username}: {e}")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'del_channel':
+        if text.startswith('@'):
+            chat_username = text
+        elif 't.me/' in text:
+            chat_username = '@' + text.split('t.me/')[1].split('/')[0]
+        else:
+            bot.send_message(user_id, "لینک یا آیدی معتبر بفرستید.")
+            return
+        try:
+            chat = bot.get_chat(chat_username)
+            with db_lock:
+                cur.execute("DELETE FROM required_chats WHERE chat_id=?", (chat.id,))
+                conn.commit()
+            bot.send_message(user_id, "کانال/گروه حذف شد.")
+        except Exception as e:
+            bot.send_message(user_id, "خطا در حذف.")
+            logging.error(f"Error deleting channel {chat_username}: {e}")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'change_ref_score':
+        try:
+            new_score = float(text)
+            set_referral_score(new_score)
+            bot.send_message(user_id, "مقدار تغییر کرد.")
+        except ValueError:
+            bot.send_message(user_id, "عدد معتبر وارد کنید.")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'set_support':
+        set_support_text(text)
+        bot.send_message(user_id, "متن پشتیبانی بروز شد.")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif state == 'set_guide':
+        set_guide_text(text)
+        bot.send_message(user_id, "متن راهنما بروز شد.")
+        del user_states[user_id]
+        bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+
+    elif text == 'پیام همگانی':
+        if is_admin(user_id):
+            user_states[user_id] = 'broadcast'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "پیام خود را ارسال کنید تا برای همه بفرستم.", reply_markup=markup)
+
+    elif text == 'افزودن ادمین':
+        if is_owner(user_id):
+            user_states[user_id] = 'add_admin'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "یوزرنیم ادمین جدید را بفرستید (@username) یا آیدی عددی", reply_markup=markup)
+        else:
+            bot.send_message(user_id, "شما دسترسی ندارید.")
+
+    elif text == 'حذف ادمین':
+        if is_owner(user_id):
+            user_states[user_id] = 'del_admin'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "یوزرنیم ادمین برای حذف بفرستید (@username) یا آیدی عددی", reply_markup=markup)
+        else:
+            bot.send_message(user_id, "شما دسترسی ندارید.")
+
+    elif text == 'افزودن کانال/گروه':
+        if is_admin(user_id):
+            user_states[user_id] = 'add_channel'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "ادمین محترم، اول ربات را ادمین کنید سپس آیدی یا لینک کانال/گروه را بفرستید.", reply_markup=markup)
+
+    elif text == 'حذف کانال/گروه':
+        if is_admin(user_id):
+            user_states[user_id] = 'del_channel'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "آیدی یا لینک کانال/گروه برای حذف بفرستید.", reply_markup=markup)
+
+    elif text == 'تغییر مقدار زیرمجموعه':
+        if is_owner(user_id):
+            user_states[user_id] = 'change_ref_score'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "مقدار جدید را وارد کنید (مثل 0.5)", reply_markup=markup)
+        else:
+            bot.send_message(user_id, "شما دسترسی ندارید.")
+
+    elif text == 'تنظیم متن پشتیبانی':
+        if is_admin(user_id):
+            user_states[user_id] = 'set_support'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "متن جدید پشتیبانی را بفرستید.", reply_markup=markup)
+
+    elif text == 'تنظیم متن راهنما':
+        if is_admin(user_id):
+            user_states[user_id] = 'set_guide'
+            markup = ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.add("لغو")
+            bot.send_message(user_id, "متن جدید راهنما را بفرستید.", reply_markup=markup)
+
+    elif text == 'لیست درخواست‌های برداشت':
+        if is_admin(user_id):
+            requests = get_pending_requests()
+            if not requests:
+                bot.send_message(user_id, "هیچ درخواست pending وجود ندارد.")
+            else:
+                msg = "لیست درخواست‌های pending:\n"
+                for req in requests:
+                    req_id, uid, amount, created = req
+                    with db_lock:
+                        cur.execute("SELECT username FROM users WHERE user_id=?", (uid,))
+                        username = cur.fetchone()[0]
+                    msg += f"ID: {req_id} | کاربر: @{username} ({uid}) | مقدار: {amount} | زمان: {created}\n"
+                bot.send_message(user_id, msg)
+                bot.send_message(user_id, "برای تایید: /end req_id رسید\nبرای رد: /reject req_id")
+
+    elif text == 'آمار کلی':
+        if is_admin(user_id):
+            with db_lock:
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+                cur.execute("SELECT SUM(score) FROM users")
+                total_scores = cur.fetchone()[0] or 0.0
+                cur.execute("SELECT COUNT(*) FROM withdraw_requests WHERE status='pending'")
+                pending_withdraws = cur.fetchone()[0]
+            required_chats = len(get_required_chats())
+            msg = f"آمار:\nکاربران: {total_users}\nمجموع امتیازات: {total_scores}\nدرخواست‌های pending: {pending_withdraws}\nکانال‌های required: {required_chats}"
+            bot.send_message(user_id, msg)
+
+    elif text in ['برگشت', 'لغو']:
+        if user_id in user_states:
+            del user_states[user_id]
+        if is_admin(user_id):
+            bot.send_message(user_id, "بازگشت به پنل.", reply_markup=admin_menu(user_id))
+        else:
+            bot.send_message(user_id, "بازگشت.", reply_markup=ReplyKeyboardRemove())
+
+bot.infinity_polling(allowed_updates=['message', 'callback_query', 'chat_member'])
