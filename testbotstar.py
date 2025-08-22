@@ -4,6 +4,7 @@ import sqlite3
 import time
 import threading
 from datetime import datetime
+import re
 
 TOKEN = '8358000057:AAHRxNRay0kS4T2k10EKB13f_i0rut8E4JQ'
 OWNER_ID = 7391705411
@@ -200,16 +201,17 @@ def start_handler(message):
 @bot.message_handler(content_types=['contact'])
 def contact_handler(message):
     user_id = message.from_user.id
-    phone = message.contact.phone_number
+    phone_raw = message.contact.phone_number
+    digits = re.sub(r'\D', '', phone_raw)
     normalized_phone = None
-    if phone.startswith('+98'):
-        if len(phone) == 13 and phone[3:].isdigit() and phone[3] == '9':
-            normalized_phone = phone
-    elif phone.startswith('09'):
-        if len(phone) == 11 and phone[2:].isdigit():
-            normalized_phone = '+98' + phone[1:]
-    if normalized_phone is None:
-        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx یا 09xxxxxxxxxx). لطفا دوباره امتحان کنید.")
+    if len(digits) == 12 and digits.startswith('989'):
+        normalized_phone = '+' + digits
+    elif len(digits) == 11 and digits.startswith('09'):
+        normalized_phone = '+98' + digits[1:]
+    elif len(digits) == 10 and digits.startswith('9'):
+        normalized_phone = '+98' + digits
+    if normalized_phone is None or not (normalized_phone.startswith('+98') and len(normalized_phone) == 13 and normalized_phone[3:].isdigit() and normalized_phone[3] == '9'):
+        bot.send_message(user_id, "شماره باید ایرانی معتبر باشد (+989xxxxxxxxx یا 09xxxxxxxxxx یا 9xxxxxxxxxx). لطفا دوباره امتحان کنید.")
         return
 
     cur.execute("UPDATE users SET phone=?, verified=1 WHERE user_id=?", (normalized_phone, user_id))
